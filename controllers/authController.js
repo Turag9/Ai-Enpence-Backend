@@ -2,6 +2,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import pool from '../db.js';
 import { defaultCategories } from '../utils/defaultCategories.js';
+import { sendOtpEmail } from '../utils/mailer.js';
 
 const signToken = (userId) =>
   jwt.sign({ userId }, process.env.JWT_SECRET, { expiresIn: '7d' });
@@ -110,5 +111,115 @@ export const getMe = async (req, res) => {
   } catch (error) {
     console.error('GetMe error:', error);
     res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// ─── Forgot Password: generate OTP and send email ────────────────────────────
+export const forgotPassword = async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ message: 'Email is required' });
+
+  try {
+    const result = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (result.rows.length === 0) {
+      // security: don't reveal if email exists
+      return res.json({ message: 'If that email exists, an OTP has been sent.' });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString(); // 6-digit
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    // Store OTP in DB (upsert by email)
+    await pool.query(
+      `INSERT INTO password_reset_tokens (email, otp, expires_at)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (email) DO UPDATE SET otp = $2, expires_at = $3, used = false`,
+      [email, otp, expiresAt]
+    );
+
+    await sendOtpEmail(email, otp);
+    res.json({ message: 'If that email exists, an OTP has been sent.' });
+  } catch (error) {
+    console.error('ForgotPassword error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// ─── Verify OTP ───────────────────────────────────────────────────────────────
+export const verifyOtp = async (req, res) => {
+  const { email, otp } = req.body;
+  if (!email || !otp) return res.status(400).json({ message: 'Email and OTP are required' });
+
+  try {
+    const result = await pool.query(
+      `SELECT * FROM password_reset_tokens WHERE email = $1`,
+      [email]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(400).json({ message: 'Invalid OTP' });
+    }
+
+    const record = result.rows[0];
+    if (record.used) return res.status(400).json({ message: 'OTP already used' });
+    if (new Date() > new Date(record.expires_at)) {
+      return res.status(400).json({ message: 'OTP expired' });
+    }
+    if (record.otp !== otp) {
+      return res.status(400).json({ message: 'Invalid OTP' });
+    }
+
+    res.json({ message: 'OTP verified', valid: true });
+  } catch (error) {
+    console.error('VerifyOtp error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// ─── Reset Password ───────────────────────────────────────────────────────────
+export const resetPassword = async (req, res) => {
+  const { email, otp, newPassword } = req.body;
+  if (!email || !otp || !newPassword) {
+    return res.status(400).json({ message: 'Email, OTP and new password are required' });
+  }
+  if (newPassword.length < 6) {
+    return res.status(400).json({ message: 'Password must be at least 6 characters' });
+  }
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `SELECT * FROM password_reset_tokens WHERE email = $1`,
+      [email]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(400).json({ message: 'Invalid request' });
+    }
+
+    const record = result.rows[0];
+    if (record.used) return res.status(400).json({ message: 'OTP already used' });
+    if (new Date() > new Date(record.expires_at)) {
+      return res.status(400).json({ message: 'OTP expired' });
+    }
+    if (record.otp !== otp) {
+      return res.status(400).json({ message: 'Invalid OTP' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(newPassword, salt);
+
+    await client.query('BEGIN');
+    await client.query('UPDATE users SET password_hash = $1 WHERE email = $2', [passwordHash, email]);
+    await client.query('UPDATE password_reset_tokens SET used = true WHERE email = $1', [email]);
+    await client.query('COMMIT');
+
+    res.json({ message: 'Password reset successful' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('ResetPassword error:', error);
+    res.status(500).json({ message: 'Server error' });
+  } finally {
+    client.release();
   }
 };
